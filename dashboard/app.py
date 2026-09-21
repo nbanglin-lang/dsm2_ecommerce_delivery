@@ -43,10 +43,11 @@ status_labels = {
 
 # Variable names stay tied to their "with tabN:" content blocks below;
 # only the unpacking ORDER changes here to control left-to-right tab position.
-tab1, tab3, tab5, tab2, tab4 = st.tabs([
+tab1, tab3, tab5, tab6, tab2, tab4 = st.tabs([
     "📊 Overview",
     "🚚 Delivery Performance",
     "🔎 Delay Root Cause",
+    "📦 Delay by Product Category",
     "🏪 Seller Performance",
     "⭐ Customer Satisfaction"
 ])
@@ -841,6 +842,8 @@ with tab5:
     """)
 
     transit_drivers = transit_drivers[transit_drivers["distance_band"] != "4. unknown"]
+    # Unclassified bars rest on ~14 delivered orders; shown in the expander below instead.
+    transit_drivers = transit_drivers[transit_drivers["order_shape"] != "unclassified"]
 
     distance_order = ["1. same_city", "2. same_state", "3. cross_state"]
     distance_labels = {
@@ -897,7 +900,7 @@ with tab5:
             "avg_transit_days": "Avg transit days",
             "order_shape_label": "Order shape"
         },
-        title="Average transit time by fulfillment shape, within each distance band"
+        title="Average transit time by order shape, within each distance band"
     )
     fig_transit.update_layout(height=480)
 
@@ -930,4 +933,220 @@ with tab5:
 
     st.caption(
         "Order volume (% of all orders), slow seller handoff could be one of the underlying issue for delivery transits."
+    )
+
+    # --------------------------------------------------------
+    # LATE % BY ORDER SHAPE
+    # --------------------------------------------------------
+
+    fig_late = px.bar(
+        transit_drivers,
+        x="distance_band_label",
+        y="late_pct_display",
+        color="order_shape_label",
+        barmode="group",
+        color_discrete_map=shape_color_map,
+        text=transit_drivers["late_pct_display"].round(1).astype(str) + "%",
+        labels={
+            "distance_band_label": "Distance band",
+            "late_pct_display": "Late %",
+            "order_shape_label": "Order shape"
+        },
+        title="Late % by order shape, within each distance band"
+    )
+    fig_late.update_traces(textposition="outside")
+    fig_late.update_layout(height=480)
+
+    st.plotly_chart(fig_late, use_container_width=True)
+
+    st.caption(
+        "Late % = share of delivered orders that arrived after the estimated delivery date "
+        "Olist showed the customer at purchase. Undelivered orders are excluded. Slow "
+        "handoff barely changes transit time above, but it multiplies the late rate: the "
+        "delay happens before the parcel reaches the carrier."
+    )
+
+    # --------------------------------------------------------
+    # UNCLASSIFIED ORDERS
+    # --------------------------------------------------------
+
+    with st.expander("View unclassified orders (excluded from the charts above)"):
+        unclassified = query(f"""
+            SELECT
+                distance_band,
+                unclassified_reason,
+                order_status,
+                order_count,
+                delivered_order_count,
+                avg_transit_days
+            FROM `{REPORTING_DATASET}.mart_transit_unclassified`
+        """)
+
+        reason_labels = {
+            "no_items_on_order": "No items on order",
+            "never_approved_or_shipped": "Never approved or shipped",
+            "approval_timestamp_missing": "Approval timestamp missing",
+            "never_handed_to_carrier": "Never handed to carrier"
+        }
+        all_distance_labels = {**distance_labels, "4. unknown": "Unknown (no seller)"}
+
+        total_unclassified = int(unclassified["order_count"].sum())
+        total_delivered = int(unclassified["delivered_order_count"].sum())
+
+        st.markdown(
+            f"**{total_unclassified:,} orders** could not be classified because no seller "
+            f"handoff could be measured. Only **{total_delivered:,}** of them were delivered "
+            f"with a transit time, which is too few to plot alongside the other segments."
+        )
+
+        by_reason = (
+            unclassified.groupby("unclassified_reason", as_index=False)[
+                ["order_count", "delivered_order_count"]
+            ].sum()
+            .sort_values("order_count", ascending=False)
+        )
+        by_reason["unclassified_reason"] = by_reason["unclassified_reason"].map(reason_labels)
+        st.dataframe(
+            by_reason.rename(columns={
+                "unclassified_reason": "Reason",
+                "order_count": "Orders",
+                "delivered_order_count": "Delivered (has transit time)"
+            }),
+            hide_index=True,
+            use_container_width=True
+        )
+
+        detail = unclassified.copy()
+        detail["distance_band"] = detail["distance_band"].map(all_distance_labels)
+        detail["unclassified_reason"] = detail["unclassified_reason"].map(reason_labels)
+        detail["avg_transit_days"] = detail["avg_transit_days"].round(1)
+        st.dataframe(
+            detail.rename(columns={
+                "distance_band": "Distance band",
+                "unclassified_reason": "Reason",
+                "order_status": "Order status",
+                "order_count": "Orders",
+                "delivered_order_count": "Delivered",
+                "avg_transit_days": "Avg transit days"
+            }),
+            hide_index=True,
+            use_container_width=True
+        )
+
+# ============================================================
+# TAB 6 — DELAY ROOT CAUSE
+# ============================================================
+
+with tab6:
+
+    st.header("Delays by Product Category and Size")
+
+    st.write(
+        "Business Question: Which products experience more delivery problems, by category and weight/size? "
+        "Also, highlighting problematic product categories that have high freight costs and high late deliveries"
+    )
+
+    # --------------------------------------------------------
+    # SECTION 1 -- WHICH PRODUCT CATEGORY EXPERIENCES MORE DELAYS
+    # --------------------------------------------------------
+
+    st.subheader("Significantly more delays for larger buckets sizes in Electronics and Construction.")
+
+    df = query(f"""
+        SELECT
+            product_category_buckets,
+            product_size_buckets,
+            product_item_count,
+            avg_delivery_days,
+            late_item_count,
+            on_time_item_count,
+            not_delivered_item_count,
+            late_item_pct,
+            avg_freight_per_item
+        FROM `{REPORTING_DATASET}.mart_pdt_delivery`
+    """)
+
+    size_order = ['S', 'M', 'L', 'XL']
+    df['late_pct_display'] = df['late_item_pct'] * 100
+
+    # Set dynamic height for matrix views so long text rows have enough space
+    dynamic_height = max(450, len(df['product_category_buckets'].unique()) * 30)
+
+    # --- Chart 1: Late Delivery Percentage Heatmap ---
+    st.subheader("1. Late Delivery Risk Matrix (Heatmap)")
+    st.markdown("Which category and size combinations are more likely to face delays?")
+
+    # Pivot data to form a matrix for the heatmap
+    heatmap_data = df.pivot(
+        index='product_category_buckets',
+        columns='product_size_buckets',
+        values='late_item_pct'
+    )
+
+    # Reorder columns to match standard size progression
+    heatmap_data = heatmap_data.reindex(columns=[s for s in size_order if s in heatmap_data.columns])
+    heatmap_data_pct = heatmap_data * 100
+
+    fig_heat = px.imshow(
+        heatmap_data_pct,
+        labels=dict(x="Product Size Bucket", y="Product Category", color="Late Rate (%)"),
+        x=heatmap_data_pct.columns,
+        y=heatmap_data_pct.index,
+        color_continuous_scale='Reds',
+        title="Late Delivery Probability (%) Matrix",
+        text_auto=".1f",
+        aspect="auto"
+    )
+    fig_heat.update_layout(height=dynamic_height, margin=dict(l=150))
+    st.plotly_chart(fig_heat, use_container_width=True)
+    st.caption(
+        "41.2% of order delays in XL bucket for Electronics & Technology. "
+        "Only 1 item in XL bucket for Food, Beverage & Party, leading to no delays."
+        " Further investigation is needed to understand the root cause of the delays, "
+        "which could be due to logistics issues for larger size products or "
+        "that freight costs may not be correctly priced"
+    )
+
+    st.divider()
+
+    # ----------------------------------------------------------------------------------------
+    # SECTION 2 -- HIGHLIGHTING PROBLEMATIC CATEGORIES WITH HIGH FREIGHT COSTS AND HIGH DELAYS
+    # ----------------------------------------------------------------------------------------
+
+    st.subheader("High freight costs and high delays for larger Automotives, Construction and Furniture.")
+
+    fig_scatter = px.scatter(
+        df,
+        x='avg_freight_per_item',
+        y='late_pct_display',
+        color='product_size_buckets',
+        size='product_item_count',
+        category_orders={'product_size_buckets': size_order},
+        title="Freight Cost vs. Delay Correlation Map (Bubble Size = Order Volume)",
+        labels={
+            'avg_freight_per_item': 'Average Freight Cost ($)',
+            'late_pct_display': 'Late Delivery Rate (%)',
+            'product_size_buckets': 'Size Bucket',
+            'product_item_count': 'Total Items'
+        },
+        hover_data=['product_category_buckets'],  # Long text shows neatly inside the hover popup instead of overcrowding axes
+        color_discrete_sequence=px.colors.qualitative.Safe,
+        range_x=[0, 100],  # Caps Freight from $0 to $100
+        range_y=[0, 20],    # Caps Late Delivery Rate from 0% to 20%
+        size_max=50
+    )
+
+    fig_scatter.update_layout(
+        height=550,
+        xaxis_title="Average Freight Cost per Item ($)",
+        yaxis_title="Late Delivery Rate (%)",
+        legend_title="Size Bucket"
+    )
+    st.plotly_chart(fig_scatter, use_container_width=True)
+
+    st.caption(
+        "Significantly higher late deliveries in XL Buckets for  "
+        "Automotives, Construction and Furniture even with higher freight costs. "
+        " Possible logistics issues with 3rd party carriers and delivery agents "
+        "or that XL packages may need special treatment and even higher freight costs."
     )
